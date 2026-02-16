@@ -1,2 +1,4 @@
-imagemagick
 ffmpeg
+imagemagick
+libespeak-ng1
+ghostscript
