@@ -1,0 +1,10 @@
+streamlit
+moviepy==1.0.3
+gTTS
+requests
+beautifulsoup4
+rake-nltk
+numpy
+Pillow
+nltk
+decorator==4.4.2
