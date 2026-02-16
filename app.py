@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from gtts import gTTS
 from moviepy.editor import *
 from moviepy.config import change_settings
-from moviepy.video.fx.all import crop, resize, scroll
+from moviepy.video.fx.all import crop, resize, fadein
 from PIL import Image, ImageFilter
 import numpy as np
 import textwrap
@@ -17,7 +17,6 @@ import nltk
 import PIL.Image
 import uuid
 import random
-import multiprocessing
 
 # هذا الكود يعيد تعريف ANTIALIAS إذا كانت مفقودة ليعمل MoviePy
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -37,6 +36,57 @@ def download_nltk_resources():
     nltk.download('punkt_tab', quiet=True)
 
 download_nltk_resources()
+
+# ==============================================================================
+# وظائف مساعدة جديدة (للصوت الطويل والانتقالات)
+# ==============================================================================
+
+def generate_long_audio(text, lang='en', output_file='audio.mp3'):
+    """دالة لتقسيم النص الطويل وتوليد صوت كامل دون قص."""
+    # تقسيم النص إلى جمل لتجنب القطع في منتصف الكلمة
+    sentences = text.replace('\n', ' ').split('. ')
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) < 3000: # حد آمن لـ gTTS
+            current_chunk += sentence + ". "
+        else:
+            chunks.append(current_chunk)
+            current_chunk = sentence + ". "
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    # توليد ملفات صوتية لكل جزء
+    temp_files = []
+    unique_id = uuid.uuid4().hex
+    
+    try:
+        combined_clips = []
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip(): continue
+            chunk_filename = f"temp_chunk_{unique_id}_{i}.mp3"
+            tts = gTTS(text=chunk, lang=lang)
+            tts.save(chunk_filename)
+            temp_files.append(chunk_filename)
+            combined_clips.append(AudioFileClip(chunk_filename))
+        
+        # دمج المقاطع الصوتية
+        if combined_clips:
+            final_audio = concatenate_audioclips(combined_clips)
+            final_audio.write_audiofile(output_file)
+            final_audio.close() # إغلاق لتحرير الموارد
+            return True
+    except Exception as e:
+        st.error(f"Error generating audio: {e}")
+        return False
+    finally:
+        # تنظيف ملفات الأجزاء المؤقتة
+        for f in temp_files:
+            if os.path.exists(f):
+                try: os.remove(f)
+                except: pass
+    return False
 
 # ==============================================================================
 # 1. كود استخراج الصور
@@ -186,27 +236,19 @@ def extract_text_content_data(url):
 # ==============================================================================
 
 def create_moving_backdrop_clip(img_path, duration, screen_size=(1280, 720)):
-    # تقنية Moving Backdrop مع حركة سريعة ومستمرة وتغييرات عشوائية
+    # قراءة الصورة
     pil_img = Image.open(img_path)
     
-    # 1. الخلفية (Background) - حركة سريعة
+    # تحويل الخلفية: تغيير الحجم مع فلتر ضبابي
     bg_img = pil_img.resize((screen_size[0], screen_size[1]), Image.LANCZOS)
-    bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=20)) # تمويه أكثر للتركيز
+    bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=15))
     
+    # جعل الخلفية تتحرك (Zoom) بسرعة (0.1 بدلاً من 0.02)
     bg_clip = ImageClip(np.array(bg_img)).set_duration(duration)
-    
-    # اختيار نوع حركة الخلفية عشوائياً (Zoom In سريع أو Zoom Out سريع)
-    move_type = random.choice(['zoom_in', 'zoom_out'])
-    if move_type == 'zoom_in':
-        # تكبير سريع (0.1 بدلاً من 0.02)
-        bg_clip = bg_clip.resize(lambda t: 1 + 0.08 * t)
-    else:
-        # تصغير سريع (يبدأ مكبراً ويصغر)
-        bg_clip = bg_clip.resize(lambda t: 1.4 - 0.08 * t)
-
+    bg_clip = bg_clip.resize(lambda t: 1 + 0.15 * t)  # حركة سريعة مستمرة
     bg_clip = bg_clip.set_position(('center', 'center'))
     
-    # 2. الصورة الأمامية (Foreground)
+    # تحضير الصورة الأمامية
     w, h = pil_img.size
     target_h = int(screen_size[1] * 0.9)
     ratio = w / h
@@ -218,11 +260,12 @@ def create_moving_backdrop_clip(img_path, duration, screen_size=(1280, 720)):
         
     fg_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
     fg_clip = ImageClip(np.array(fg_img)).set_duration(duration)
+    
+    # إضافة حركة خفيفة للصورة الأمامية أيضاً لتتناغم مع الخلفية
+    fg_clip = fg_clip.resize(lambda t: 1 + 0.05 * t)
     fg_clip = fg_clip.set_position(('center', 'center'))
     
-    # دمج الخلفية والمقدمة
     final_clip = CompositeVideoClip([bg_clip, fg_clip], size=screen_size).set_duration(duration)
-    
     return final_clip
 
 def generate_youtube_metadata(title, text_list, url):
@@ -241,13 +284,13 @@ def generate_youtube_metadata(title, text_list, url):
     return tags_str, description, thumb_prompt
 
 def process_pipeline(url_input):
-    # إنشاء معرف فريد للجلسة (Session ID) لعزل المستخدمين
-    session_id = str(uuid.uuid4())[:8]
-    
     if not url_input:
         st.warning("❌ الرجاء إدخال رابط.")
         return
 
+    # إنشاء معرف فريد للجلسة الحالية لعدم خلط ملفات المستخدمين
+    session_id = uuid.uuid4().hex
+    
     # 1. استخراج المحتوى
     title, full_text, text_list = extract_text_content_data(url_input)
     if not title or not full_text:
@@ -259,30 +302,31 @@ def process_pipeline(url_input):
         st.warning("⚠️ لم يتم العثور على صور، سيتم استخدام شاشة سوداء مع النص.")
 
     # 2. توليد الصوت (TTS)
-    # -------------------------------------------------------------------
-    # تم التعديل هنا: تمت إزالة شرط تحديد 5000 حرف
-    # -------------------------------------------------------------------
-    with st.spinner("🔊 جاري توليد الصوت للنص بالكامل... (قد يستغرق وقتاً للنصوص الطويلة)"):
+    audio_file = f"generated_audio_{session_id}.mp3"
+    with st.spinner("🔊 جاري توليد الصوت..."):
+        # استخدام النص الكامل (عنوان + محتوى) بدون قص
         tts_text = f"{title}. {full_text}"
         
-        # استخدام اسم ملف فريد
-        audio_file = f"audio_{session_id}.mp3"
-        tts = gTTS(text=tts_text, lang='en')
-        tts.save(audio_file)
+        # استدعاء الدالة المساعدة لتقسيم ودمج الصوت
+        if not generate_long_audio(tts_text, 'en', audio_file):
+             # محاولة احتياطية قصيرة إذا فشل الطويل
+             tts = gTTS(text=tts_text[:1000], lang='en')
+             tts.save(audio_file)
         
         audio_clip = AudioFileClip(audio_file)
         audio_duration = audio_clip.duration
         st.success(f"✅ تم إنشاء الصوت. المدة: {audio_duration:.2f} ثانية")
 
     # 3. إعداد الفيديو
-    downloaded_images = []
+    output_filename = f"output_video_{session_id}.mp4"
+    
     with st.spinner("🎬 جاري معالجة الصور وإنشاء الفيديو..."):
         if images_urls:
-            # تحميل الصور بأسماء فريدة
+            downloaded_images = []
             for i, img_url in enumerate(images_urls):
                 try:
                     img_data = requests.get(img_url).content
-                    img_name = f"temp_{session_id}_{i}.jpg"
+                    img_name = f"temp_img_{session_id}_{i}.jpg"
                     with open(img_name, 'wb') as handler:
                         handler.write(img_data)
                     downloaded_images.append(img_name)
@@ -296,26 +340,32 @@ def process_pipeline(url_input):
             img_duration = audio_duration / len(downloaded_images)
             clips = []
             
+            # اختيار نوع انتقال عشوائي (Transition) لهذا الفيديو بالكامل
+            # الخيارات: crossfadein (تلاشي), fadein (ظهور من أسود), None (قص مباشر)
+            transition_style = random.choice(['crossfade', 'fadein_black', 'sharp'])
+            st.info(f"✨ تم اختيار نمط الانتقال: {transition_style}")
+
             for img_path in downloaded_images:
                 clip = create_moving_backdrop_clip(img_path, img_duration)
                 
-                # --- إضافة Slide Transition مختلف كل مرة ---
-                transition_type = random.choice(['crossfade', 'slide_in', 'fadein'])
+                # تطبيق الانتقال المختار
+                if transition_style == 'crossfade':
+                    clip = clip.crossfadein(1.0)
+                elif transition_style == 'fadein_black':
+                    clip = clip.fadein(1.0)
+                # إذا كان sharp لا نضيف تأثير
                 
-                fade_duration = random.uniform(0.5, 1.5)
-                
-                if transition_type == 'crossfade':
-                    clip = clip.crossfadein(fade_duration)
-                elif transition_type == 'fadein':
-                    clip = clip.fadein(fade_duration)
-                else:
-                    # محاكاة بسيطة للـ Slide عبر الـ Fade السريع
-                    clip = clip.crossfadein(0.3) 
-
                 clips.append(clip)
             
             # دمج الكليبات
-            final_video = concatenate_videoclips(clips, method="compose", padding=-1)
+            # padding=-1 ضروري لعمل crossfade بشكل صحيح
+            pad_val = -1 if transition_style == 'crossfade' else 0
+            final_video = concatenate_videoclips(clips, method="compose", padding=pad_val)
+            
+            # التأكد من مطابقة مدة الفيديو للصوت (قد تختلف قليلاً بسبب الانتقالات)
+            if final_video.duration < audio_duration:
+                # تمديد آخر إطار إذا لزم الأمر
+                pass 
         else:
             color_clip = ColorClip(size=(1280, 720), color=(0,0,0), duration=audio_duration)
             txt_clip = TextClip(title, fontsize=70, color='white', size=(1000, None), method='caption')
@@ -324,25 +374,12 @@ def process_pipeline(url_input):
 
         # 4. دمج الصوت وتصدير الفيديو
         final_video = final_video.set_audio(audio_clip)
-        output_filename = f"output_{session_id}.mp4"
         
-        st.text("⚙️ جاري تصدير الفيديو بأقصى سرعة (Ultrafast Rendering)...")
-        
-        # استخدام كل الأنوية المتاحة (Raw Processing Power)
-        available_threads = multiprocessing.cpu_count()
-        
-        # إعدادات السرعة القصوى: fps=3, preset=ultrafast
-        final_video.write_videofile(
-            output_filename, 
-            fps=3,                  # FPS 3 كما طلبت
-            codec="libx264", 
-            audio_codec="aac",
-            preset='ultrafast',     # أسرع خوارزمية ضغط
-            threads=available_threads, # استخدام تعدد الأنوية
-            logger=None             # تقليل السجلات لزيادة السرعة طفيفاً
-        )
+        st.text("⚙️ جاري تصدير الفيديو (Rendering)... FPS = 1")
+        # تم ضبط FPS على 1 كما طُلب
+        final_video.write_videofile(output_filename, fps=1, codec="libx264", audio_codec="aac")
 
-        # 5. تنظيف الملفات الخاصة بهذه الجلسة فقط
+        # 5. تنظيف الملفات (باستخدام المعرف الفريد)
         if images_urls:
             for f in downloaded_images:
                 try: os.remove(f)
@@ -368,12 +405,16 @@ def process_pipeline(url_input):
             st.download_button(
                 label="📁 Download Video",
                 data=file,
-                file_name="generated_video.mp4",
+                file_name=f"generated_video_{session_id}.mp4",
                 mime="video/mp4"
             )
+            
+        # حذف الفيديو النهائي بعد التحميل (اختياري لتوفير المساحة)
+        # try: os.remove(output_filename)
+        # except: pass
 
 # === واجهة التشغيل الرئيسية ===
-st.title("🎬 المولد الشامل السريع (Turbo Mode)")
+st.title("🎬 المولد الشامل: من الرابط إلى الفيديو")
 st.markdown("### ألصق رابط المقال أدناه")
 
 url_input_user = st.text_input("URL:", placeholder="https://www.bbc.com/news/...")
