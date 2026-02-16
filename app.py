@@ -15,6 +15,11 @@ import textwrap
 from rake_nltk import Rake
 import nltk
 
+import PIL.Image
+
+# هذا الكود يعيد تعريف ANTIALIAS إذا كانت مفقودة ليعمل MoviePy
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 # --- إعدادات النظام وتثبيت NLTK ---
 try:
     # محاولة ضبط مسار ImageMagick يدوياً لنظام لينكس (Streamlit Cloud)

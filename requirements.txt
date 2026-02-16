@@ -1,10 +1,11 @@
 streamlit
 moviepy==1.0.3
+decorator==4.4.2
+imageio==2.9.0
 gTTS
 requests
 beautifulsoup4
 rake-nltk
-numpy<1.24.0
-Pillow<10.0.0
+numpy
+Pillow
 nltk
-decorator==4.4.2
