@@ -8,16 +8,16 @@ from urllib.parse import urljoin
 from gtts import gTTS
 from moviepy.editor import *
 from moviepy.config import change_settings
-from moviepy.video.fx.all import crop, resize
+from moviepy.video.fx.all import crop, resize, scroll
 from PIL import Image, ImageFilter
 import numpy as np
 import textwrap
 from rake_nltk import Rake
 import nltk
-import uuid
-import shutil
-import random
 import PIL.Image
+import uuid
+import random
+import multiprocessing
 
 # هذا الكود يعيد تعريف ANTIALIAS إذا كانت مفقودة ليعمل MoviePy
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -39,7 +39,7 @@ def download_nltk_resources():
 download_nltk_resources()
 
 # ==============================================================================
-# 1. كود استخراج الصور (كما هو)
+# 1. كود استخراج الصور
 # ==============================================================================
 
 def get_best_image_url(img_tag, base_url):
@@ -121,7 +121,7 @@ def advanced_extract_images(url):
         return []
 
 # ==============================================================================
-# 2. كود استخراج النصوص (كما هو)
+# 2. كود استخراج النصوص
 # ==============================================================================
 
 def extract_text_content_data(url):
@@ -182,34 +182,31 @@ def extract_text_content_data(url):
         return None, None, None
 
 # ==============================================================================
-# 3. محرك إنتاج الفيديو والبيانات الوصفية (معدل للسرعة والتعددية)
+# 3. محرك إنتاج الفيديو والبيانات الوصفية
 # ==============================================================================
 
-def create_moving_backdrop_clip(img_path, duration, screen_size=(1280, 720), zoom_direction='in', speed_factor=0.06):
-    """
-    تم التعديل:
-    1. zoom_direction: لتغيير اتجاه الحركة عشوائياً.
-    2. speed_factor: زادت السرعة من 0.02 إلى 0.06 لتكون 'fast and continuous'.
-    """
+def create_moving_backdrop_clip(img_path, duration, screen_size=(1280, 720)):
+    # تقنية Moving Backdrop مع حركة سريعة ومستمرة وتغييرات عشوائية
     pil_img = Image.open(img_path)
     
-    # تحضير الخلفية المضببة
+    # 1. الخلفية (Background) - حركة سريعة
     bg_img = pil_img.resize((screen_size[0], screen_size[1]), Image.LANCZOS)
-    bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=15))
+    bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=20)) # تمويه أكثر للتركيز
     
     bg_clip = ImageClip(np.array(bg_img)).set_duration(duration)
     
-    # حركة الخلفية (سريعة ومستمرة)
-    if zoom_direction == 'in':
-        # تكبير سريع
-        bg_clip = bg_clip.resize(lambda t: 1 + speed_factor * t)
+    # اختيار نوع حركة الخلفية عشوائياً (Zoom In سريع أو Zoom Out سريع)
+    move_type = random.choice(['zoom_in', 'zoom_out'])
+    if move_type == 'zoom_in':
+        # تكبير سريع (0.1 بدلاً من 0.02)
+        bg_clip = bg_clip.resize(lambda t: 1 + 0.08 * t)
     else:
         # تصغير سريع (يبدأ مكبراً ويصغر)
-        bg_clip = bg_clip.resize(lambda t: (1 + speed_factor * duration) - speed_factor * t)
-        
+        bg_clip = bg_clip.resize(lambda t: 1.4 - 0.08 * t)
+
     bg_clip = bg_clip.set_position(('center', 'center'))
     
-    # تحضير الصورة الأمامية
+    # 2. الصورة الأمامية (Foreground)
     w, h = pil_img.size
     target_h = int(screen_size[1] * 0.9)
     ratio = w / h
@@ -223,13 +220,9 @@ def create_moving_backdrop_clip(img_path, duration, screen_size=(1280, 720), zoo
     fg_clip = ImageClip(np.array(fg_img)).set_duration(duration)
     fg_clip = fg_clip.set_position(('center', 'center'))
     
-    # حركة طفيفة للصورة الأمامية أيضاً لإضافة ديناميكية
-    if zoom_direction == 'in':
-         fg_clip = fg_clip.resize(lambda t: 1 + (speed_factor/2) * t)
-    else:
-         fg_clip = fg_clip.resize(lambda t: 1 + (speed_factor/2) * (duration - t))
-
+    # دمج الخلفية والمقدمة
     final_clip = CompositeVideoClip([bg_clip, fg_clip], size=screen_size).set_duration(duration)
+    
     return final_clip
 
 def generate_youtube_metadata(title, text_list, url):
@@ -248,29 +241,17 @@ def generate_youtube_metadata(title, text_list, url):
     return tags_str, description, thumb_prompt
 
 def process_pipeline(url_input):
+    # إنشاء معرف فريد للجلسة (Session ID) لعزل المستخدمين
+    session_id = str(uuid.uuid4())[:8]
+    
     if not url_input:
         st.warning("❌ الرجاء إدخال رابط.")
         return
-
-    # --- عزل الجلسة (Multi-User Support) ---
-    session_id = str(uuid.uuid4())
-    session_dir = os.path.join(os.getcwd(), f"temp_{session_id}")
-    os.makedirs(session_dir, exist_ok=True)
-    
-    # تحديد مسارات الملفات داخل مجلد الجلسة
-    audio_file = os.path.join(session_dir, "generated_audio.mp3")
-    output_filename = os.path.join(session_dir, "output_video.mp4")
-
-    # تحديد متغيرات عشوائية للفيديو الحالي (Different Slide Transition every time)
-    # نختار عشوائياً سرعة الحركة واتجاهها لهذا الفيديو بالكامل أو لكل شريحة
-    base_zoom_speed = random.uniform(0.04, 0.08) # حركة سريعة جداً
-    transition_duration = random.uniform(0.5, 1.5) # مدة انتقال متغيرة
 
     # 1. استخراج المحتوى
     title, full_text, text_list = extract_text_content_data(url_input)
     if not title or not full_text:
         st.error("❌ فشل في استخراج النص.")
-        shutil.rmtree(session_dir, ignore_errors=True)
         return
         
     images_urls = advanced_extract_images(url_input)
@@ -284,6 +265,8 @@ def process_pipeline(url_input):
             st.info("⚠️ النص طويل جداً، سيتم استخدام أول 5000 حرف للصوت.")
             tts_text = tts_text[:5000]
             
+        # استخدام اسم ملف فريد
+        audio_file = f"audio_{session_id}.mp3"
         tts = gTTS(text=tts_text, lang='en')
         tts.save(audio_file)
         
@@ -292,13 +275,14 @@ def process_pipeline(url_input):
         st.success(f"✅ تم إنشاء الصوت. المدة: {audio_duration:.2f} ثانية")
 
     # 3. إعداد الفيديو
-    with st.spinner("🎬 جاري معالجة الصور وإنشاء الفيديو (60 FPS)..."):
+    downloaded_images = []
+    with st.spinner("🎬 جاري معالجة الصور وإنشاء الفيديو..."):
         if images_urls:
-            downloaded_images = []
+            # تحميل الصور بأسماء فريدة
             for i, img_url in enumerate(images_urls):
                 try:
                     img_data = requests.get(img_url).content
-                    img_name = os.path.join(session_dir, f"temp_img_{i}.jpg")
+                    img_name = f"temp_{session_id}_{i}.jpg"
                     with open(img_name, 'wb') as handler:
                         handler.write(img_data)
                     downloaded_images.append(img_name)
@@ -307,54 +291,70 @@ def process_pipeline(url_input):
             
             if not downloaded_images:
                 st.error("❌ فشل تحميل الصور.")
-                shutil.rmtree(session_dir, ignore_errors=True)
                 return
 
             img_duration = audio_duration / len(downloaded_images)
             clips = []
             
-            for i, img_path in enumerate(downloaded_images):
-                # عشوائية في الاتجاه لكل شريحة لتغيير النمط
-                direction = random.choice(['in', 'out'])
+            for img_path in downloaded_images:
+                clip = create_moving_backdrop_clip(img_path, img_duration)
                 
-                clip = create_moving_backdrop_clip(
-                    img_path, 
-                    img_duration, 
-                    zoom_direction=direction, 
-                    speed_factor=base_zoom_speed
-                )
+                # --- إضافة Slide Transition مختلف كل مرة ---
+                transition_type = random.choice(['crossfade', 'slide_in', 'fadein'])
                 
-                # تطبيق انتقال (Transition)
-                # Crossfade هو الأكثر دعماً وسرعة في المعالجة الخام
-                clip = clip.crossfadein(transition_duration)
+                # لاحظ: concatenate_videoclips لا تدعم transitions معقدة مباشرة بسهولة في MoviePy 1.x
+                # لذا نعتمد على crossfadein المتغير أو fadein كأسرع طريقة.
+                # للحصول على تأثير بصري متنوع، نغير مدة الـ Fade
+                
+                fade_duration = random.uniform(0.5, 1.5)
+                
+                if transition_type == 'crossfade':
+                    clip = clip.crossfadein(fade_duration)
+                elif transition_type == 'fadein':
+                    clip = clip.fadein(fade_duration)
+                else:
+                    # محاكاة بسيطة للـ Slide عبر الـ Fade السريع
+                    clip = clip.crossfadein(0.3) 
+
                 clips.append(clip)
             
-            # الدمج باستخدام compose لضمان عمل الانتقالات بشكل صحيح
-            final_video = concatenate_videoclips(clips, method="compose", padding=-transition_duration)
+            # دمج الكليبات
+            final_video = concatenate_videoclips(clips, method="compose", padding=-1)
         else:
             color_clip = ColorClip(size=(1280, 720), color=(0,0,0), duration=audio_duration)
             txt_clip = TextClip(title, fontsize=70, color='white', size=(1000, None), method='caption')
             txt_clip = txt_clip.set_position('center').set_duration(audio_duration)
             final_video = CompositeVideoClip([color_clip, txt_clip])
 
-        # 4. دمج الصوت وتصدير الفيديو (إعدادات السرعة القصوى)
+        # 4. دمج الصوت وتصدير الفيديو
         final_video = final_video.set_audio(audio_clip)
+        output_filename = f"output_{session_id}.mp4"
         
-        st.text("⚙️ جاري تصدير الفيديو (Rendering) بأقصى سرعة (Ultrafast, Multi-core, 60FPS)...")
+        st.text("⚙️ جاري تصدير الفيديو بأقصى سرعة (Ultrafast Rendering)...")
         
-        # استخدام كل الأنوية المتاحة
-        cpu_count = os.cpu_count() or 2
+        # استخدام كل الأنوية المتاحة (Raw Processing Power)
+        available_threads = multiprocessing.cpu_count()
         
+        # إعدادات السرعة القصوى: fps=3, preset=ultrafast
         final_video.write_videofile(
             output_filename, 
-            fps=60,                  # مطلوب: 60 إطار
+            fps=3,                  # FPS 3 كما طلبت
             codec="libx264", 
             audio_codec="aac",
-            preset="ultrafast",      # مطلوب: أسرع ضغط
-            threads=cpu_count        # مطلوب: استخدام كل الأنوية
+            preset='ultrafast',     # أسرع خوارزمية ضغط
+            threads=available_threads, # استخدام تعدد الأنوية
+            logger=None             # تقليل السجلات لزيادة السرعة طفيفاً
         )
 
-        # 5. عرض المخرجات والبيانات
+        # 5. تنظيف الملفات الخاصة بهذه الجلسة فقط
+        if images_urls:
+            for f in downloaded_images:
+                try: os.remove(f)
+                except: pass
+        try: os.remove(audio_file)
+        except: pass
+
+        # 6. عرض المخرجات
         st.success("✅ COMPLETED SUCCESSFULLY")
         
         tags, desc, thumb = generate_youtube_metadata(title, text_list, url_input)
@@ -372,21 +372,16 @@ def process_pipeline(url_input):
             st.download_button(
                 label="📁 Download Video",
                 data=file,
-                file_name=f"generated_video_{session_id[:8]}.mp4",
+                file_name="generated_video.mp4",
                 mime="video/mp4"
             )
-
-    # 6. تنظيف ملفات الجلسة (Cleanup)
-    # لا نقوم بالحذف فوراً إذا كان المستخدم يحتاج للتحميل، ولكن Streamlit يعيد التشغيل عند التفاعل.
-    # الحل الأمثل هنا: ترك الملفات حتى يتم الضغط على التحميل، أو الاعتماد على أن النظام يمسح المجلدات القديمة.
-    # في Streamlit البسيط، سنترك التنظيف لنهاية الجلسة أو بداية جديدة، 
-    # ولكن لضمان المساحة سنقوم بتنظيف مجلدات الجلسات القديمة (اختيارياً)
-    # هنا سنكتفي بعدم الحذف الفوري للمجلد للسماح بالتحميل.
-    
-    # (ملاحظة: لضمان النظافة، يمكن جدولة حذف المجلد لاحقاً، لكن الكود الحالي يعزل كل مستخدم بـ ID)
+        
+        # تنظيف ملف الفيديو النهائي بعد السماح بالتحميل (اختياري، هنا نتركه للمستخدم)
+        # try: os.remove(output_filename)
+        # except: pass
 
 # === واجهة التشغيل الرئيسية ===
-st.title("🎬 المولد الشامل السريع (60FPS Turbo)")
+st.title("🎬 المولد الشامل السريع (Turbo Mode)")
 st.markdown("### ألصق رابط المقال أدناه")
 
 url_input_user = st.text_input("URL:", placeholder="https://www.bbc.com/news/...")
